@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
     SSH 配置删除脚本 (Windows PowerShell)
@@ -208,9 +208,9 @@ if ($cleanRemote -eq 'y' -or $cleanRemote -eq 'Y') {
     # 尝试用 config 中的信息连接
     $port = if ($target.Port) { $target.Port } else { "22" }
     $user = $target.User
-    $host = $target.HostName
+    $remoteHost = $target.HostName
 
-    if ($user -and $host) {
+    if ($user -and $remoteHost) {
         # 获取公钥内容用于匹配（如果还存在的话）
         $pubContent = $null
         if (Test-Path $keyPubPath) {
@@ -220,10 +220,10 @@ if ($cleanRemote -eq 'y' -or $cleanRemote -eq 'Y') {
         if ($pubContent) {
             # 精确删除匹配行
             $escapedKey = $pubContent -replace '/', '\/' -replace '\+', '\+' -replace '\=', '\='
-            ssh -p $port "${user}@${host}" "sed -i '/$(echo $pubContent | sed 's/[\/&]/\\&/g')/d' ~/.ssh/authorized_keys 2>/dev/null && echo '已移除远程公钥' || echo '远程操作失败'"
+            ssh -p $port "${user}@${remoteHost}" "sed -i '/$(echo $pubContent | sed 's/[\/&]/\\&/g')/d' ~/.ssh/authorized_keys 2>/dev/null && echo '已移除远程公钥' || echo '远程操作失败'"
         } else {
             Write-Warn "公钥文件已删除，无法精确匹配。"
-            Write-Info "请手动登录 ${user}@${host} -p ${port} 编辑 ~/.ssh/authorized_keys"
+            Write-Info "请手动登录 ${user}@${remoteHost} -p ${port} 编辑 ~/.ssh/authorized_keys"
         }
     } else {
         Write-Warn "config 中信息不完整，无法自动清理远程公钥。"
