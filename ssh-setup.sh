@@ -348,9 +348,14 @@ if grep -q "^Host $ALIAS\$" "$CONFIG_FILE" 2>/dev/null; then
     warn "SSH config 中已存在 Host $ALIAS 配置，跳过写入。"
     info "如需修改，请手动编辑: $CONFIG_FILE"
 else
+    # 写入标记行：记录模式/密钥/指纹，供日后核对与 ssh-remove 判断风险（mode=2 为服务端下发私钥）
+    FP_HASH=$( { key_fingerprint "$KEY_FILE" | sed -n 's/.*\(SHA256:[A-Za-z0-9+/=]*\).*/\1/p' | head -1; } || true )
+    CREATED=$(date +%Y%m%d-%H%M)
+
     cat >> "$CONFIG_FILE" <<EOF
 
 Host $ALIAS
+    # ssh-quick-setup: mode=$MODE key=$KEY_NAME ${FP_HASH:+fp=$FP_HASH }created=$CREATED
     HostName $HOSTNAME_VAL
     Port $PORT
     User $USERNAME

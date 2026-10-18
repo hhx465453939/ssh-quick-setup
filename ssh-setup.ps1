@@ -456,9 +456,18 @@ if ($alreadyConfigured) {
     Write-Warn "SSH config 中已存在 Host $Alias 配置，跳过写入。"
     Write-Info "如需修改，请手动编辑: $ConfigFile"
 } else {
+    # 写入标记行：记录模式/密钥/指纹，供日后核对与 ssh-remove 判断风险（mode=2 为服务端下发私钥）
+    $fpLine = Get-KeyFingerprint -Path $KeyFile
+    $fpHash = ""
+    if ($fpLine -match '(SHA256:[A-Za-z0-9+/=]+)') { $fpHash = $Matches[1] }
+    $marker = "    # ssh-quick-setup: mode=$Mode key=$keyName"
+    if ($fpHash) { $marker += " fp=$fpHash" }
+    $marker += " created=$(Get-Date -Format 'yyyyMMdd-HHmm')"
+
     $entry = @"
 
 Host $Alias
+$marker
     HostName $HostName
     Port $Port
     User $UserName

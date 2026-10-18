@@ -180,6 +180,52 @@ ssh <别名>
 
 ---
 
+## 五之三、确认/清理远端 authorized_keys（闭环核对）
+
+删完本地密钥后，怎么知道远端那条公钥到底删没删？用下面两步。
+
+### 1. 核对（只读，不改任何东西）
+
+```bash
+# ① 列出远端所有公钥的指纹，并逐条对照（最直观）
+ssh -p <端口> <用户名>@<地址> "ssh-keygen -lf ~/.ssh/authorized_keys"
+
+# ② 在本机取出你要找的那把公钥的指纹，用于对照
+ssh-keygen -lf ~/.ssh/id_rsa_<别名>
+
+# ③ 精确搜索（固定字符串整串匹配）：输出 0 表示已不在
+ssh -p <端口> <用户名>@<地址> "grep -c -F 'ssh-ed25519 AAAA...' ~/.ssh/authorized_keys"
+```
+
+### 2. 清理（先备份、再删、再回读验证）
+
+```bash
+ssh -p <端口> <用户名>@<地址> '
+  f="$HOME/.ssh/authorized_keys"
+  blob="ssh-ed25519 AAAA..."        # 要删的公钥：type + base64（注释之前的部分）
+  before=$(grep -cF "$blob" "$f" 2>/dev/null || true); [ -n "$before" ] || before=0
+  echo "BEFORE=$before"
+  if [ "$before" -gt 0 ]; then
+    cp -p "$f" "$f.bak.$(date +%Y%m%d-%H%M%S)"                    # 先备份
+    grep -vF "$blob" "$f" > "$f.new" && cat "$f.new" > "$f" && rm -f "$f.new"
+    chmod 600 "$f"
+  fi
+  echo "AFTER=$(grep -cF "$blob" "$f" 2>/dev/null || true)"
+'
+```
+
+要点：
+
+- 用 `grep -F`（固定字符串）而不是 `sed` 的正则：公钥里的 `/` `+` `=` 在正则里是元字符，容易误伤或根本删不掉。
+- 必须删前备份 + 删后回读计数：`BEFORE=1` / `AFTER=0` 才算真的删掉。
+- **顺序很重要：先确认/清理远端，再删本地私钥**。本地私钥删掉后就登不上去了，想改远端只能靠面板或另一把密钥。
+- 服务端已关闭密码认证、且远端条目是你唯一入口时，删掉它就是永久失联。
+
+> 自动化脚本（`ssh-remove.ps1` / `ssh-remove.sh`）已经把上面这套做成了交互流程，
+> 并在结束时打印可直接复制的核对命令。
+
+---
+
 ## 六、常见问题
 
 | 现象 | 原因 / 处理 |
@@ -188,6 +234,7 @@ ssh <别名>
 | 想输密码却直接 `Permission denied (publickey)`（根本没给输密码的机会） | 服务端已关闭密码认证（`Authentications that can continue:` 只有 `publickey`）→ 改用场景 B，或让管理员先把你的公钥装上去 |
 | `Load key ...: invalid format` / `is not a key file` | 私钥带 `CRLF` 行尾或 UTF-8 BOM → 按场景 B 第 1 步归一化为 LF 并去掉 BOM |
 | 原有别名全部失效，报 `no argument after keyword "\357\273\277"` | `config` 文件带 UTF-8 BOM（PS 5.1 的 `Add-Content/Set-Content -Encoding UTF8` 会加 BOM）→ 以无 BOM 重写该文件 |
+| 删完本地密钥后，不确定远端那条公钥是否也删了 | 见第五之三节：先 `ssh-keygen -lf ~/.ssh/authorized_keys` 列指纹对照，再 `grep -c -F '<公钥串>'` 确认输出 0 |
 | `UNPROTECTED PRIVATE KEY FILE` | 仅 Windows：执行第四节 `icacls` 命令 |
 | 不确定哪一步出错 | 登录加 `-v` 调试：`ssh -v -i ~/.ssh/id_ed25519_<别名> <用户名>@<地址>`，观察是否出现 `Server accepts key` |
 
