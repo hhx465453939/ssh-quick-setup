@@ -7,12 +7,32 @@ set -euo pipefail
 SSH_DIR="$HOME/.ssh"
 CONFIG_FILE="$SSH_DIR/config"
 
+# Windows 上 HOME 可能未指向真实用户目录，则回退 USERPROFILE
+if [[ ! -d "$HOME" && -n "${USERPROFILE:-}" ]]; then
+    SSH_DIR="$USERPROFILE/.ssh"
+    CONFIG_FILE="$SSH_DIR/config"
+fi
+
+# 修复历史遗留的 UTF-8 BOM（OpenSSH 遇到 BOM 会放弃解析整个 config）
+repair_config_bom() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    local head3
+    head3=$(head -c 3 "$CONFIG_FILE" | od -An -tx1 | tr -d ' \n')
+    [[ "$head3" == "efbbbf" ]] || return 0
+    cp "$CONFIG_FILE" "$CONFIG_FILE.bak-bom"
+    tail -c +4 "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
+    warn "检测到 config 带 UTF-8 BOM（OpenSSH 会拒绝解析整个 config），已自动修复"
+    info "原始文件已备份: $CONFIG_FILE.bak-bom"
+}
+
 # ── 颜色 ──────────────────────────────────────────────────────
 step()  { echo -e "\n\033[36m>>> $1\033[0m"; }
 ok()    { echo -e "  \033[32m[OK]\033[0m $1"; }
 warn()  { echo -e "  \033[33m[!]\033[0m $1"; }
 err()   { echo -e "  \033[31m[X]\033[0m $1"; }
 info()  { echo -e "  \033[90m$1\033[0m"; }
+
+repair_config_bom
 
 # ── 解析 SSH config ───────────────────────────────────────────
 parse_ssh_config() {
@@ -67,10 +87,9 @@ remove_config_entry() {
         echo "$line"
     done < "$CONFIG_FILE" > "$tmpfile"
 
-    # 清理尾部空行
-    local content
-    content=$(sed -e :a -e '/^\n*$/{$d;N;ba' "$tmpfile")
-    echo "$content" > "$CONFIG_FILE"
+    # 删除尾部空行，只保留一个结尾换行
+    # （原来用 sed -e :a -e '/^\n*$/{$d;N;ba' 少了收尾的 -e '}'，在 GNU sed 下会报 unmatched '{' 并中断）
+    awk 'NR>0 {l[NR]=$0} END {last=NR; while (last>0 && l[last]=="") last--; for (i=1;i<=last;i++) print l[i]}' "$tmpfile" > "$CONFIG_FILE"
     rm -f "$tmpfile"
 }
 
@@ -116,9 +135,20 @@ if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [[ "$CHOICE" -lt 1 ]] || [[ "$CHOICE" -gt ${
 fi
 
 IFS='|' read -r ALIAS HOST_NAME PORT USER_NAME KEY_FILE <<< "${ENTRIES[$((CHOICE-1))]}"
-KEY_BASENAME="id_ed25519_$ALIAS"
-KEY_PATH="$SSH_DIR/$KEY_BASENAME"
-KEY_PUB_PATH="$KEY_PATH.pub"
+
+# 密钥路径优先取自 config 里的 IdentityFile（兼容导入模式下的 id_rsa_<别名>）
+KEY_PATH=""
+if [[ -n "$KEY_FILE" ]]; then
+    KEY_PATH="${KEY_FILE/#\~/$HOME}"
+    KEY_PATH="${KEY_PATH/#\~/$SSH_DIR}"
+    [[ "$KEY_PATH" == /* || "$KEY_PATH" == [A-Za-z]:* ]] || KEY_PATH="$SSH_DIR/$KEY_PATH"
+    [[ -f "$KEY_PATH" ]] || KEY_PATH=""
+fi
+if [[ -z "$KEY_PATH" && -f "$SSH_DIR/id_ed25519_$ALIAS" ]]; then
+    KEY_PATH="$SSH_DIR/id_ed25519_$ALIAS"
+fi
+KEY_BASENAME="$(basename "${KEY_PATH:-id_ed25519_$ALIAS}")"
+KEY_PUB_PATH="${KEY_PATH:+$KEY_PATH.pub}"
 
 echo ""
 echo -e "  \033[33m即将删除:\033[0m"
@@ -127,7 +157,8 @@ echo -e "  别名   : $ALIAS"
 echo -e "  地址   : $HOST_NAME"
 echo -e "  端口   : $PORT"
 echo -e "  用户   : $USER_NAME"
-[[ -f "$KEY_PATH" ]] && echo -e "  密钥   : $KEY_PATH"
+[[ -n "$KEY_PATH" ]] && echo -e "  密钥   : $KEY_PATH"
+[[ -n "$KEY_PUB_PATH" && -f "$KEY_PUB_PATH" ]] && echo -e "  公钥   : $KEY_PUB_PATH"
 echo -e "  \033[90m-------------------------------\033[0m"
 
 # ── 确认 ───────────────────────────────────────────────────────
@@ -140,7 +171,7 @@ read -rp "  确认删除? 请输入 yes 继续: " CONFIRM
 DELETED=()
 
 # 1. 删除密钥
-if [[ -f "$KEY_PATH" ]] || [[ -f "$KEY_PUB_PATH" ]]; then
+if [[ -n "$KEY_PATH" ]] && { [[ -f "$KEY_PATH" ]] || [[ -f "$KEY_PUB_PATH" ]]; }; then
     rm -f "$KEY_PATH" "$KEY_PUB_PATH"
     ok "已删除密钥: $KEY_BASENAME / ${KEY_BASENAME}.pub"
     DELETED+=("密钥文件")

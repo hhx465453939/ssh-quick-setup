@@ -18,6 +18,24 @@
 
 ---
 
+## 〇.五、先判断走哪个场景
+
+先看服务端允许哪些认证方式（本命令不会真正登录）：
+
+```bash
+ssh -v -o BatchMode=yes -o PreferredAuthentications=none -p <端口> <用户名>@<地址> true 2>&1 | grep "Authentications that can continue"
+```
+
+| 输出 | 含义 | 走哪个场景 |
+|------|------|------------|
+| 含 `password` | 服务端允许密码登录，你可以自己把公钥装上去 | **场景 A**（第一~六节） |
+| 只有 `publickey` | 服务端已关闭密码登录；公钥通常由服务商/管理员预置，并下发了配套私钥 | **场景 B**（第五节之后） |
+
+> 若你手里已经有一个服务商/管理员给的**私钥文件**（常见于 VPS 开通邮件、面板下载），
+> 直接走场景 B：**不要**再生成新密钥，也**不要**尝试上传公钥（密码通道既然关了，上传必然失败）。
+
+---
+
 ## 一、生成密钥对（本地）
 
 **Windows (PowerShell)：**
@@ -86,7 +104,7 @@ Linux/macOS 生成时已是 `600`，无需此步。
 
 ---
 
-## 五、配置别名并登录
+## 五、配置别名并登录（场景 A / B 通用）
 
 **方式 A：直接命令登录**
 
@@ -116,11 +134,60 @@ ssh <别名>
 
 ---
 
+## 五之二、场景 B：服务端已下发私钥（无密码登录）
+
+> 适用于：服务商/管理员给你一个**私钥文件**，服务器上已预置配套公钥，密码登录已关闭。
+> 你需要的只是把这份私钥规范化地放到本机并指定给 `ssh` 使用。
+
+### 1. 归一化并落盘（关键：去掉 BOM、CRLF → LF）
+
+从网页/面板复制保存的私钥常带 `CRLF` 行尾或 UTF-8 BOM，
+新版 OpenSSH 会直接报 `invalid format` / `is not a key file` 而不加载。
+
+**Windows (PowerShell)：**
+
+```powershell
+$src  = "$env:USERPROFILE\Desktop\私钥_xxx.txt"
+$text = ([System.IO.File]::ReadAllText($src) -replace "`r`n", "`n") -replace "`r", "`n"
+[System.IO.File]::WriteAllText("$env:USERPROFILE\.ssh\id_rsa_<别名>", $text, (New-Object System.Text.UTF8Encoding($false)))
+icacls "$env:USERPROFILE\.ssh\id_rsa_<别名>" /inheritance:r /grant:r "$env:USERNAME:F"
+ssh-keygen -lf "$env:USERPROFILE\.ssh\id_rsa_<别名>"    # 能打印指纹即成功
+```
+
+**Linux / macOS：**
+
+```bash
+tr -d '\r' < ~/私钥_xxx.txt > ~/.ssh/id_rsa_<别名>
+chmod 600 ~/.ssh/id_rsa_<别名>
+ssh-keygen -lf ~/.ssh/id_rsa_<别名>    # 能打印指纹即成功
+```
+
+### 2. 配置别名并登录
+
+按第五节方式 B 写入 `~/.ssh/config`，`IdentityFile` 指向刚落盘的私钥，然后：
+
+```bash
+ssh <别名>
+```
+
+### 3. 注意事项
+
+- **不需要**执行第一~三节（不生成新密钥、不需要管理员再授权）。
+- 若私钥有口令，每次登录需输入；可用 `ssh-keygen -p -f ~/.ssh/id_rsa_<别名>` 改口令。
+- `.ppk`（PuTTY）或 `BEGIN ENCRYPTED PRIVATE KEY`（加密 PKCS#8）需先转换：
+  `puttygen in.ppk -O private-openssh -o out.key` / `openssl pkcs8 -in in.pem -out out.key`。
+- 配置成功后，建议删除桌面/下载目录里的私钥原件（那里会被同步、备份、被其它程序可读）。
+
+---
+
 ## 六、常见问题
 
 | 现象 | 原因 / 处理 |
 |------|-------------|
 | `Permission denied (publickey)` | 公钥未正确写入 `authorized_keys`，或管理员侧权限不符合第三节清单 |
+| 想输密码却直接 `Permission denied (publickey)`（根本没给输密码的机会） | 服务端已关闭密码认证（`Authentications that can continue:` 只有 `publickey`）→ 改用场景 B，或让管理员先把你的公钥装上去 |
+| `Load key ...: invalid format` / `is not a key file` | 私钥带 `CRLF` 行尾或 UTF-8 BOM → 按场景 B 第 1 步归一化为 LF 并去掉 BOM |
+| 原有别名全部失效，报 `no argument after keyword "\357\273\277"` | `config` 文件带 UTF-8 BOM（PS 5.1 的 `Add-Content/Set-Content -Encoding UTF8` 会加 BOM）→ 以无 BOM 重写该文件 |
 | `UNPROTECTED PRIVATE KEY FILE` | 仅 Windows：执行第四节 `icacls` 命令 |
 | 不确定哪一步出错 | 登录加 `-v` 调试：`ssh -v -i ~/.ssh/id_ed25519_<别名> <用户名>@<地址>`，观察是否出现 `Server accepts key` |
 

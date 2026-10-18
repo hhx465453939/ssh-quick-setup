@@ -9,7 +9,14 @@
 #>
 
 $ErrorActionPreference = "Stop"
-$SshDir = "$env:USERPROFILE\.ssh"
+
+# 定位 .ssh 目录（同 ssh-setup.ps1：MSYS 版 ssh 读 HOME，Windows 原生 OpenSSH 读 USERPROFILE）
+if ($env:HOME -and ($env:HOME -match '^[A-Za-z]:[\\/]' -or $env:HOME -match '^\\\\')) {
+    $SshHome = $env:HOME
+} else {
+    $SshHome = $env:USERPROFILE
+}
+$SshDir = "$SshHome\.ssh"
 $ConfigFile = "$SshDir\config"
 
 # ── 颜色辅助 ──────────────────────────────────────────────────
@@ -88,7 +95,8 @@ function Remove-SshConfigEntry {
     $trimmed = $newContent | Where-Object { $_ -ne $null }
     $text = ($trimmed -join "`n").TrimEnd()
     $text += "`n"
-    Set-Content -Path $Path -Value $text -Encoding UTF8 -NoNewline
+    # 必须无 BOM 写入：带 BOM 的 config 会让 OpenSSH 拒绝解析整个文件
+    [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
 
     return $found
 }
@@ -121,7 +129,7 @@ Write-Host "`n  当前已配置的 SSH 连接:" -ForegroundColor White
 Write-Host "  -------------------------------" -ForegroundColor Gray
 for ($i = 0; $i -lt $entries.Count; $i++) {
     $e = $entries[$i]
-    Write-Host ("  [{0}] {1,-12} {2}@{3}:{4}" -f ($i+1), $e.Name, $e.User, $e.HostName, $e.Port) -ForegroundColor White
+    Write-Host ("  [{0}] {1,-12} {2}@{3}:{4}" -f ($i+1), $e.Name, $e.User, $e.HostName, $(if ($e.Port) { $e.Port } else { '22' })) -ForegroundColor White
 }
 Write-Host "  -------------------------------" -ForegroundColor Gray
 
@@ -144,16 +152,28 @@ Write-Host "  即将删除:" -ForegroundColor Yellow
 Write-Host "  -------------------------------" -ForegroundColor Gray
 Write-Host "  别名   : $alias" -ForegroundColor White
 Write-Host "  地址   : $($target.HostName)" -ForegroundColor White
-Write-Host "  端口   : $($target.Port)" -ForegroundColor White
+Write-Host "  端口   : $(if ($target.Port) { $target.Port } else { '22' })" -ForegroundColor White
 Write-Host "  用户   : $($target.User)" -ForegroundColor White
 
-# 检查密钥文件
-$keyBasename = "id_ed25519_$alias"
-$keyPath = "$SshDir\$keyBasename"
-$keyPubPath = "$keyPath.pub"
-$hasKey = Test-Path $keyPath
+# 检查密钥文件（优先用 config 里记录的 IdentityFile，兼容模式 2 导入的密钥）
+$keyPath = ""
+if ($target.KeyFile) {
+    $kf = ($target.KeyFile.Trim() -replace '^~', $SshHome)
+    if (-not [System.IO.Path]::IsPathRooted($kf)) { $kf = Join-Path $SshDir $kf }
+    if (Test-Path $kf) { $keyPath = $kf }
+}
+if (-not $keyPath) {
+    $fallback = "$SshDir\id_ed25519_$alias"
+    if (Test-Path $fallback) { $keyPath = $fallback }
+}
+$keyPubPath = if ($keyPath) { "$keyPath.pub" } else { "$SshDir\id_ed25519_$alias.pub" }
+$hasKey = [bool]$keyPath
+$keyBasename = if ($hasKey) { [System.IO.Path]::GetFileName($keyPath) } else { "id_ed25519_$alias" }
 if ($hasKey) {
     Write-Host "  密钥   : $keyPath" -ForegroundColor White
+}
+if (Test-Path $keyPubPath) {
+    Write-Host "  公钥   : $keyPubPath" -ForegroundColor White
 }
 
 Write-Host "  -------------------------------" -ForegroundColor Gray
@@ -170,10 +190,10 @@ if ($confirm -ne 'yes') {
 $deleted = @()
 
 # 1. 删除密钥文件
-if ($hasKey) {
+if ($hasKey -or (Test-Path $keyPubPath)) {
     $removedAny = $false
     foreach ($f in @($keyPath, $keyPubPath)) {
-        if (Test-Path $f) {
+        if ($f -and (Test-Path $f)) {
             Remove-Item $f -Force
             $removedAny = $true
         }
