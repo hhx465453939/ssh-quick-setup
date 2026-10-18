@@ -176,11 +176,14 @@ function New-LocalKey {
         Remove-Item $keyFile, "$keyFile.pub" -Force -ErrorAction SilentlyContinue
     }
 
+    # 注释里带时间戳：同一别名反复生成时，服务端 ssh-keygen -lf 能一眼看出哪把是最新的
+    $comment = "$Alias-ssh-key-$(Get-Date -Format 'yyyyMMdd-HHmm')"
+
     # -N '""' 是 PowerShell 下传空口令的正确写法（写成 -N "" 会被吞掉参数）
-    $r = Invoke-Native 'ssh-keygen' @('-t', 'ed25519', '-C', "$Alias-ssh-key", '-f', $keyFile, '-N', '""')
+    $r = Invoke-Native 'ssh-keygen' @('-t', 'ed25519', '-C', $comment, '-f', $keyFile, '-N', '""')
     if ($r.ExitCode -ne 0 -or -not (Test-Path $keyFile)) {
         Write-Warn "非交互生成失败，改用交互式生成（口令处直接回车即为免密）..."
-        & ssh-keygen -t ed25519 -C "$Alias-ssh-key" -f $keyFile
+        & ssh-keygen -t ed25519 -C $comment -f $keyFile
         if ($LASTEXITCODE -ne 0 -or -not (Test-Path $keyFile)) {
             Write-Err "密钥生成失败。"
             return $null
@@ -196,6 +199,8 @@ function New-LocalKey {
 
     Write-Ok "私钥: $keyFile"
     Write-Ok "公钥: $keyFile.pub"
+    $fp = Get-KeyFingerprint -Path $keyFile
+    if ($fp -match '(SHA256:[A-Za-z0-9+/=]+)') { Write-Info "指纹: $($Matches[1])  (复制留底，日后可在服务端核对)" }
     return $keyFile
 }
 
@@ -293,7 +298,7 @@ function Import-ServerKey {
         if ($y.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($y.Output)) {
             # 去掉 ssh-keygen -y 自动附加的文件路径注释，换成可读注释
             $parts = ($y.Output.Trim() -split '\s+')
-            $pubLine = "$($parts[0]) $($parts[1]) $Alias-ssh-key"
+            $pubLine = "$($parts[0]) $($parts[1]) $Alias-ssh-key-$(Get-Date -Format 'yyyyMMdd-HHmm')"
             Write-TextNoBom -Path "$dest.pub" -Text ($pubLine + "`n")
         } else {
             Write-Warn "该私钥带口令，每次登录需输入口令（可执行 ssh-keygen -p -f `"$dest`" 修改）。"
@@ -512,6 +517,11 @@ Write-Host "  地址       : $HostName" -ForegroundColor White
 Write-Host "  端口       : $Port" -ForegroundColor White
 Write-Host "  用户       : $UserName" -ForegroundColor White
 Write-Host "  私钥       : $KeyFile" -ForegroundColor White
+$fpOut = Get-KeyFingerprint -Path $KeyFile
+if ($fpOut -match '(SHA256:[A-Za-z0-9+/=]+)') {
+    Write-Host "  公钥指纹   : $($Matches[1])" -ForegroundColor White
+    Write-Host "  远端核对   : ssh -p $Port ${UserName}@${HostName} `"ssh-keygen -lf ~/.ssh/authorized_keys`"" -ForegroundColor Gray
+}
 Write-Host "  快捷命令   : ssh $Alias" -ForegroundColor Green
 Write-Host ""
 Write-Host "  如需删除配置: .\ssh-remove.ps1" -ForegroundColor Gray

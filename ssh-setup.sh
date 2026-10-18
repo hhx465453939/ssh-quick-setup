@@ -86,18 +86,21 @@ new_local_key() {
 
     KEY_FILE="$SSH_DIR/id_ed25519_$alias"
 
+    # 注释里带时间戳：同一别名反复生成时，服务端 ssh-keygen -lf 能一眼看出哪把是最新的
+    local COMMENT="${alias}-ssh-key-$(date +%Y%m%d-%H%M)"
+
     if [[ -f "$KEY_FILE" ]]; then
         warn "密钥文件已存在: $KEY_FILE"
         read -rp "  是否覆盖重新生成? (y/N): " REGEN
         if [[ "$REGEN" == "y" || "$REGEN" == "Y" ]]; then
             rm -f "$KEY_FILE" "$KEY_FILE.pub"
-            ssh-keygen -t ed25519 -C "${alias}-ssh-key" -f "$KEY_FILE" -N ""
+            ssh-keygen -t ed25519 -C "$COMMENT" -f "$KEY_FILE" -N ""
             ok "密钥已重新生成"
         else
             info "保留现有密钥，跳过生成。"
         fi
     else
-        ssh-keygen -t ed25519 -C "${alias}-ssh-key" -f "$KEY_FILE" -N ""
+        ssh-keygen -t ed25519 -C "$COMMENT" -f "$KEY_FILE" -N ""
     fi
 
     set_key_perm "$KEY_FILE"
@@ -108,6 +111,9 @@ new_local_key() {
 
     ok "私钥: $KEY_FILE"
     ok "公钥: $KEY_FILE.pub"
+    local FP1
+    FP1=$( { key_fingerprint "$KEY_FILE" | sed -n 's/.*\(SHA256:[A-Za-z0-9+/=]*\).*/\1/p' | head -1; } || true )
+    [[ -n "$FP1" ]] && info "指纹: $FP1  (复制留底，日后可在服务端核对)"
 }
 
 # ── 模式 2：导入服务端下发的私钥 ──────────────────────────────
@@ -192,7 +198,7 @@ import_server_key() {
 
         # 顺带导出公钥便于核对；失败说明该私钥带口令
         if ssh-keygen -y -P "" -f "$dest" > "$dest.pub.raw" 2>/dev/null; then
-            awk -v c="${alias}-ssh-key" '{print $1, $2, c}' "$dest.pub.raw" > "$dest.pub"
+            awk -v c="${alias}-ssh-key-$(date +%Y%m%d-%H%M)" '{print $1, $2, c}' "$dest.pub.raw" > "$dest.pub"
             rm -f "$dest.pub.raw"
             ok "已导出公钥: $dest.pub"
         else
@@ -403,6 +409,11 @@ echo -e "  地址       : $HOSTNAME_VAL"
 echo -e "  端口       : $PORT"
 echo -e "  用户       : $USERNAME"
 echo -e "  私钥       : $KEY_FILE"
+FP_OUT=$( { key_fingerprint "$KEY_FILE" | sed -n 's/.*\(SHA256:[A-Za-z0-9+/=]*\).*/\1/p' | head -1; } || true )
+if [[ -n "$FP_OUT" ]]; then
+    echo -e "  公钥指纹   : $FP_OUT"
+    echo -e "  \033[90m远端核对   : ssh -p $PORT ${USERNAME}@${HOSTNAME_VAL} \"ssh-keygen -lf ~/.ssh/authorized_keys\"\033[0m"
+fi
 echo -e "  \033[32m快捷命令   : ssh $ALIAS\033[0m"
 echo ""
 echo -e "  \033[90m如需删除配置: bash ssh-remove.sh\033[0m"
