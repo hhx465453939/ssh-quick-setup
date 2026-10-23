@@ -91,6 +91,74 @@ function Invoke-Native {
     }
 }
 
+# ── 空口令调用的可靠通道 ──────────────────────────────────────
+# 实测坑：PowerShell 5.1 向原生程序传空字符串参数不可靠。
+#   -N ''   → 参数被整个丢弃（ssh-keygen 报错，或 -N 被当文件名生成 "-N" 垃圾文件）
+#   -N '""' → 经数组 splatting 后可能变成字面两个引号，成了真实口令
+#   后果：私钥带口令 → ssh 在 BatchMode 下不提示输入口令 → 直接跳过 publickey
+#         → 回落 password → 报 Permission denied (publickey,password)，现象就是"免密没生效"
+# 因此凡需"空口令"语义的 ssh-keygen 操作，一律交给 bash 执行（Git for Windows 自带，与 ssh 同源）。
+$script:BashExe = $null
+
+function Get-BashPath {
+    if ($null -ne $script:BashExe) {
+        if ($script:BashExe -eq '') { return $null }
+        return $script:BashExe
+    }
+    $script:BashExe = ''
+    # 优先选与 ssh-keygen 同源的 Git bash（路径语义一致，能直接吃 C:/ 风格路径）
+    $kg = Get-Command ssh-keygen -ErrorAction SilentlyContinue
+    if ($kg -and $kg.Source) {
+        $gitRoot = Split-Path (Split-Path $kg.Source -Parent) -Parent
+        $cand = Join-Path $gitRoot 'bin\bash.exe'
+        if (Test-Path $cand) { $script:BashExe = $cand }
+    }
+    if ($script:BashExe -eq '') {
+        $cmd = Get-Command bash -ErrorAction SilentlyContinue
+        # 排除 WSL 的 System32\bash.exe（它看不到 C:/ 路径）
+        if ($cmd -and $cmd.Source -notmatch '\\System32\\bash\.exe$') { $script:BashExe = $cmd.Source }
+    }
+    if ($script:BashExe -eq '') { return $null }
+    return $script:BashExe
+}
+
+function ConvertTo-UnixPath {
+    param([string]$Path)
+    return ($Path -replace '\\', '/')
+}
+
+# bash 单引号包裹（内部不再展开变量），并转义文本里可能出现的单引号
+function Quote-Bash {
+    param([string]$Text)
+    return "'" + ($Text -replace "'", "'\''") + "'"
+}
+
+function Invoke-InBash {
+    param([string]$Command)
+    $bash = Get-BashPath
+    if (-not $bash) { return $null }
+    return (Invoke-Native $bash @('-c', $Command))
+}
+
+# 用空口令解出公钥：拿到公钥文本 = 私钥无口令；$null = 带口令或损坏
+# 注意：无 bash 通道时直接返回 $null，绝不退化成"不带 -P 调 ssh-keygen"——
+#       带口令的私钥会去读控制台，把脚本挂死。
+function Get-PublicKeyFromPrivate {
+    param([string]$Path)
+    if (-not (Get-BashPath)) { return $null }
+    $u = ConvertTo-UnixPath $Path
+    $r = Invoke-InBash "ssh-keygen -y -P '' -f $(Quote-Bash $u) 2>/dev/null"
+    if ($r -and $r.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.Output)) { return $r.Output.Trim() }
+    return $null
+}
+
+# 三态：$true 免密 / $false 带口令 / $null 无法判定（无 bash 通道）
+function Test-KeyPassphraseFree {
+    param([string]$Path)
+    if (-not (Get-BashPath)) { return $null }
+    return [bool](Get-PublicKeyFromPrivate -Path $Path)
+}
+
 # Windows 私钥权限收紧（权限过宽时 OpenSSH 报 UNPROTECTED PRIVATE KEY FILE）
 function Set-KeyAcl {
     param([string]$Path)
@@ -179,22 +247,47 @@ function New-LocalKey {
     # 注释里带时间戳：同一别名反复生成时，服务端 ssh-keygen -lf 能一眼看出哪把是最新的
     $comment = "$Alias-ssh-key-$(Get-Date -Format 'yyyyMMdd-HHmm')"
 
-    # -N '""' 是 PowerShell 下传空口令的正确写法（写成 -N "" 会被吞掉参数）
-    $r = Invoke-Native 'ssh-keygen' @('-t', 'ed25519', '-C', $comment, '-f', $keyFile, '-N', '""')
-    if ($r.ExitCode -ne 0 -or -not (Test-Path $keyFile)) {
-        Write-Warn "非交互生成失败，改用交互式生成（口令处直接回车即为免密）..."
-        & ssh-keygen -t ed25519 -C $comment -f $keyFile
-        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $keyFile)) {
+    # 空口令靠 bash 传（见上方说明）；命令里只用单引号，避开 PowerShell 的引号二次转义
+    $unixKey = ConvertTo-UnixPath $keyFile
+    $genCmd = "ssh-keygen -q -t ed25519 -C $(Quote-Bash $comment) -f $(Quote-Bash $unixKey) -N ''"
+
+    $keyReady = $false
+    for ($attempt = 1; $attempt -le 2; $attempt++) {
+        $ok = $false
+        if (Get-BashPath) {
+            $r = Invoke-InBash $genCmd
+            $ok = ($r -and $r.ExitCode -eq 0 -and (Test-Path $keyFile))
+        }
+        if (-not $ok) {
+            Write-Warn "非交互生成失败，改用交互式生成（口令处直接回车即为免密）..."
+            & ssh-keygen -t ed25519 -C $comment -f $keyFile
+            $ok = ($LASTEXITCODE -eq 0 -and (Test-Path $keyFile))
+        }
+        if (-not $ok) {
             Write-Err "密钥生成失败。"
             return $null
         }
+
+        Set-KeyAcl -Path $keyFile
+
+        # 闭环校验：私钥必须能被空口令解开，否则免密不可能成立
+        $pf = Test-KeyPassphraseFree -Path $keyFile
+        if ($pf -ne $false) {
+            if ($null -eq $pf) {
+                Write-Warn "未找到 bash 通道，跳过私钥口令校验。"
+                Write-Info "若登录时提示 Enter passphrase，执行: ssh-keygen -p -f `"$keyFile`""
+            }
+            $keyReady = $true; break
+        }
+
+        Write-Warn "生成的私钥带口令（空参数传递缺陷），删除后重新生成..."
+        Remove-Item $keyFile, "$keyFile.pub" -Force -ErrorAction SilentlyContinue
     }
 
-    Set-KeyAcl -Path $keyFile
-
-    $chk = Invoke-Native 'ssh-keygen' @('-y', '-P', '""', '-f', $keyFile)
-    if ($chk.ExitCode -ne 0) {
-        Write-Warn "该私钥带口令，每次登录需输入口令（可执行 ssh-keygen -p -f `"$keyFile`" 修改）。"
+    if (-not $keyReady) {
+        Write-Err "两次生成均带口令，免密登录无法成立。"
+        Write-Info "请手动执行后重跑本脚本: ssh-keygen -t ed25519 -f `"$keyFile`"  （口令处连按两次回车）"
+        return $null
     }
 
     Write-Ok "私钥: $keyFile"
@@ -293,15 +386,19 @@ function Import-ServerKey {
 
         Set-KeyAcl -Path $dest
 
-        # 顺带导出公钥便于核对；失败说明该私钥带口令
-        $y = Invoke-Native 'ssh-keygen' @('-y', '-P', '""', '-f', $dest)
-        if ($y.ExitCode -eq 0 -and -not [string]::IsNullOrWhiteSpace($y.Output)) {
+        # 顺带导出公钥便于核对；空口令解不出说明该私钥带口令（免密会失效）
+        $pubRaw = Get-PublicKeyFromPrivate -Path $dest
+        if ($pubRaw) {
             # 去掉 ssh-keygen -y 自动附加的文件路径注释，换成可读注释
-            $parts = ($y.Output.Trim() -split '\s+')
+            $parts = ($pubRaw -split '\s+')
             $pubLine = "$($parts[0]) $($parts[1]) $Alias-ssh-key-$(Get-Date -Format 'yyyyMMdd-HHmm')"
             Write-TextNoBom -Path "$dest.pub" -Text ($pubLine + "`n")
         } else {
-            Write-Warn "该私钥带口令，每次登录需输入口令（可执行 ssh-keygen -p -f `"$dest`" 修改）。"
+            if ((Test-KeyPassphraseFree -Path $dest) -eq $false) {
+                Write-Warn "该私钥带口令，每次登录需输入口令（可执行 ssh-keygen -p -f `"$dest`" 修改）。"
+            } else {
+                Write-Info "未能导出公钥（未找到 bash 通道），不影响登录。"
+            }
         }
 
         Write-Ok "已导入私钥: $dest"
@@ -336,7 +433,9 @@ function Send-PublicKey {
     $MaxRetries = 3
     for ($i = 1; $i -le $MaxRetries; $i++) {
         Write-Info "第 $i 次尝试..."
-        Get-Content "$KeyFile.pub" -Raw | & ssh -p $Port "${User}@${TargetHost}" $remoteCmd
+        # 归一化为 LF：CRLF 会原样写进 authorized_keys（虽多数情况可容忍，但没必要留隐患）
+        $pubText = (Get-Content "$KeyFile.pub" -Raw) -replace "`r`n", "`n"
+        $pubText | & ssh -p $Port "${User}@${TargetHost}" $remoteCmd
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "公钥上传成功!"
             return $true
@@ -502,6 +601,10 @@ if ($Test -ne 'n' -and $Test -ne 'N') {
         Write-Ok "免密登录配置完成!"
     } else {
         Write-Warn "连接测试失败，请检查网络或服务器配置。"
+        if ((Test-KeyPassphraseFree -Path $KeyFile) -eq $false) {
+            Write-Err "私钥带口令：BatchMode 测试时 ssh 不会提示输入口令，publickey 被直接跳过。"
+            Write-Info "修复: ssh-keygen -p -f `"$KeyFile`"  （旧口令回车 → 新口令直接回车）"
+        }
         Write-Info "排查命令: ssh -v -i `"$KeyFile`" -p $Port ${UserName}@${HostName}"
     }
 }
