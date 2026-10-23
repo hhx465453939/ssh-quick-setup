@@ -94,13 +94,28 @@ new_local_key() {
         read -rp "  是否覆盖重新生成? (y/N): " REGEN
         if [[ "$REGEN" == "y" || "$REGEN" == "Y" ]]; then
             rm -f "$KEY_FILE" "$KEY_FILE.pub"
-            ssh-keygen -t ed25519 -C "$COMMENT" -f "$KEY_FILE" -N ""
+            if ! ssh-keygen -t ed25519 -C "$COMMENT" -f "$KEY_FILE" -N ""; then
+                err "密钥生成失败。"
+                return 1
+            fi
+            # 以产物为准：keygen 返回 0 但公钥没落地（磁盘满、权限异常）也算失败
+            if [[ ! -f "$KEY_FILE" || ! -f "$KEY_FILE.pub" ]]; then
+                err "密钥文件不完整 (私钥或公钥缺失)，已中止。"
+                return 1
+            fi
             ok "密钥已重新生成"
         else
             info "保留现有密钥，跳过生成。"
         fi
     else
-        ssh-keygen -t ed25519 -C "$COMMENT" -f "$KEY_FILE" -N ""
+        if ! ssh-keygen -t ed25519 -C "$COMMENT" -f "$KEY_FILE" -N ""; then
+            err "密钥生成失败。"
+            return 1
+        fi
+        if [[ ! -f "$KEY_FILE" || ! -f "$KEY_FILE.pub" ]]; then
+            err "密钥文件不完整 (私钥或公钥缺失)，已中止。"
+            return 1
+        fi
     fi
 
     set_key_perm "$KEY_FILE"
@@ -222,6 +237,14 @@ send_public_key() {
 
     step "上传公钥到服务器 (需要输入一次密码)..."
 
+    # 公钥文件缺失时提前失败：给出可读的提示，而不是让 ssh-copy-id 报一串
+    # 难懂的路径错误（脚本开了 pipefail，管道本身不会假绿）
+    if [[ ! -f "$key_file.pub" ]]; then
+        err "未找到公钥文件: $key_file.pub"
+        info "请确认密钥已成功生成；若服务端已下发私钥，请改用模式 [2] 导入。"
+        return 1
+    fi
+
     if [[ -n "$auth" && "$auth" != *password* ]]; then
         warn "探测到服务端只允许 publickey 认证，本步骤大概率失败。"
         info "若这台服务器属于『服务端下发私钥』类型，请改用模式 [2] 导入。"
@@ -245,13 +268,15 @@ send_public_key() {
             ok "公钥上传成功!"
             return 0
         fi
-        # ssh-copy-id 失败时尝试 pipe 方式
+        # ssh-copy-id 失败时尝试 pipe 方式（脚本开了 pipefail，cat 读失败不会被
+        # 静默吞掉成"上传成功"）
         if cat "$key_file.pub" | ssh -p "$port" "${user}@${target_host}" "$remote_cmd" 2>/dev/null; then
             ok "公钥上传成功!"
             return 0
         fi
         warn "上传失败，请检查密码是否正确。"
-        [[ $i -lt 3 ]] && read -rp "  按回车重试..." _
+        warn "注意：每次密码错误都会计入服务端 fail2ban 计数，累计可能再次封禁你的 IP。"
+        [[ $i -lt 3 ]] && read -rp "  确认密码无误后再按回车重试 (Ctrl+C 中止): " _
     done
 
     warn "自动上传失败。"

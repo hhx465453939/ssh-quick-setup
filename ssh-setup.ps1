@@ -78,7 +78,9 @@ function Invoke-Native {
     try {
         $out = & $File @Arguments 2> $errFile
         $code = $LASTEXITCODE
-        $err = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+        # 用 .NET 读取 stderr：Get-Content -Raw 属于 FileSystem provider 的动态参数，
+        # 在受限语言模式 / 模块状态异常时会报「找不到参数 Raw」，这里统一走 .NET
+        try { $err = [System.IO.File]::ReadAllText($errFile) } catch { $err = $null }
     } finally {
         $ErrorActionPreference = $old
         Remove-Item $errFile -Force -ErrorAction SilentlyContinue
@@ -416,6 +418,13 @@ function Send-PublicKey {
 
     Write-Step "上传公钥到服务器 (需要输入一次密码)..."
 
+    # 公钥文件缺失时提前失败，避免后续读取抛出难懂的参数/路径错误
+    if (-not (Test-Path "$KeyFile.pub")) {
+        Write-Err "未找到公钥文件: $KeyFile.pub"
+        Write-Info "请确认密钥已成功生成；若服务端已下发私钥，请改用模式 [2] 导入。"
+        return $false
+    }
+
     if ($AuthMethods -and ($AuthMethods -notmatch 'password')) {
         Write-Warn "探测到服务端只允许 publickey 认证，本步骤大概率失败。"
         Write-Info "若这台服务器属于『服务端下发私钥』类型，请改用模式 [2] 导入。"
@@ -434,14 +443,17 @@ function Send-PublicKey {
     for ($i = 1; $i -le $MaxRetries; $i++) {
         Write-Info "第 $i 次尝试..."
         # 归一化为 LF：CRLF 会原样写进 authorized_keys（虽多数情况可容忍，但没必要留隐患）
-        $pubText = (Get-Content "$KeyFile.pub" -Raw) -replace "`r`n", "`n"
+        # 用 .NET 读取而非 Get-Content -Raw：-Raw 是 FileSystem provider 的动态参数，
+        # 在受限语言模式或异常模块状态下会直接崩在这里（报「找不到参数 Raw」）
+        $pubText = ([System.IO.File]::ReadAllText("$KeyFile.pub")) -replace "`r`n", "`n"
         $pubText | & ssh -p $Port "${User}@${TargetHost}" $remoteCmd
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "公钥上传成功!"
             return $true
         }
         Write-Warn "上传失败，请检查密码是否正确。"
-        if ($i -lt $MaxRetries) { Read-Host "  按回车重试..." | Out-Null }
+        Write-Warn "注意：每次密码错误都会计入服务端 fail2ban 计数，累计可能再次封禁你的 IP。"
+        if ($i -lt $MaxRetries) { Read-Host "  确认密码无误后再按回车重试 (Ctrl+C 中止)" | Out-Null }
     }
 
     Write-Warn "自动上传失败。"
