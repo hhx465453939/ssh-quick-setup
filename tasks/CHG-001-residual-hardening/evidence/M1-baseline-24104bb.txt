@@ -1,0 +1,94 @@
+# M1 基线证据 — harness 对【修复前版本 24104bb】的执行结果
+# 目的：证明测试有效性（能检出 R1 缺陷；并证伪 R2 假设）
+# 生成时间: 2026-10-24T01:57:01Z
+# 命令:
+#   git show 24104bb:ssh-remove.sh  > /tmp/base24104bb/ssh-remove.sh
+#   git show 24104bb:ssh-remove.ps1 > /tmp/base24104bb/ssh-remove.ps1
+#   REMOVE_SH=/tmp/base24104bb/ssh-remove.sh REMOVE_PS1=/tmp/base24104bb/ssh-remove.ps1 BASELINE=1 bash tests/run_checks.sh
+
+被测脚本:
+  sh : /tmp/base24104bb/ssh-remove.sh
+  ps1: /tmp/base24104bb/ssh-remove.ps1
+  (BASELINE 模式：预期部分用例失败，用于验证测试有效性)
+
+==== 0. 语法检查（仓库原生手段） ====
+  PASS  bash -n ssh-setup.sh
+  PASS  bash -n ssh-remove.sh
+  PASS  bash -n ssh-remove.sh
+  PASS  PSParser ssh-setup.ps1
+  PASS  PSParser ssh-remove.ps1
+
+==== 1. R1 多别名解析（sh 侧 / AC-1.1~1.2） ====
+  FAIL  AC-1.1 sh 列表含 beta
+        ↳ stdout 未包含 [beta]
+  FAIL  AC-1.1 sh 列表含 gamma
+        ↳ stdout 未包含 [gamma]
+  PASS  AC-1.2 sh 删除后 alpha 消失
+  PASS  AC-1.2 sh 删除后 beta 消失
+  PASS  AC-1.2 sh 删除后 gamma 消失
+  PASS  AC-1.2 sh 删除后 single 块保留
+  PASS  AC-1.2 sh single 的 HostName 保留
+
+==== 2. R1 多别名解析（ps1 侧 / AC-1.1~1.2） ====
+  FAIL  AC-1.1 ps1 列表含 beta
+        ↳ stdout 未包含 [beta]
+  FAIL  AC-1.1 ps1 列表含 gamma
+        ↳ stdout 未包含 [gamma]
+  FAIL  AC-1.2 ps1 删除后 alpha 消失
+        ↳ config 仍含 [alpha]
+  FAIL  AC-1.2 ps1 删除后 beta 消失
+        ↳ config 仍含 [beta]
+  FAIL  AC-1.2 ps1 删除后 gamma 消失
+        ↳ config 仍含 [gamma]
+  FAIL  AC-1.2 ps1 删除后 single 块保留
+        ↳ config 缺少 [single]
+
+==== 3. R1 通配保护（AC-1.3~1.4） ====
+  PASS  AC-1.3 ps1 删除普通块后 Host * 仍保留
+  PASS  AC-1.3 ps1 删除普通块后通配块仍保留
+  PASS  AC-1.3 ps1 多别名含通配时整块受保护（未被删）
+  FAIL  AC-1.3 ps1 拒绝删除后 Host 行数不变
+        ↳ 期望 [3] 实际 [2]
+  FAIL  AC-1.3 sh 多别名含通配时整块受保护（未被删）
+        ↳ config 缺少 [web*.corp]
+  FAIL  AC-1.3 sh 拒绝删除后 Host 行数不变
+        ↳ 期望 [3] 实际 [2]
+
+==== 4. R2 Match 块边界（AC-2.1~2.3） ====
+  PASS  AC-2.2 ps1 Match 段内键名不出现为条目
+  PASS  AC-2.1 ps1 删除 before-block
+  PASS  AC-2.1 ps1 Match 段键值保留(ServerAliveInterval)
+  PASS  AC-2.1 ps1 Match 段键值保留(TCPKeepAlive)
+  PASS  AC-2.1 ps1 Match 行保留
+  PASS  AC-2.3 ps1 后续 Host 块保留
+  PASS  AC-2.1 sh Match 段键值保留
+  PASS  AC-2.1 sh Match 行保留
+  PASS  AC-2.3 sh 后续 Host 块保留
+
+==== 5. CHG-000 回归（不得回退） ====
+  PASS  REG ps1 PS5.1 中文注释下仍识别 zh-block
+  PASS  REG ps1 中文注释下仍识别 zh-second
+  PASS  REG ps1 中文注释完好保留
+  PASS  REG ps1 zh-block 已删除
+  PASS  REG ps1 config 时间戳备份已生成
+  PASS  REG sh 中文注释下仍识别 zh-block
+  PASS  REG sh 中文注释完好保留
+
+══════════ 结果 ══════════
+  PASS: 29
+  FAIL: 11
+
+失败用例:
+  - AC-1.1 sh 列表含 beta
+  - AC-1.1 sh 列表含 gamma
+  - AC-1.1 ps1 列表含 beta
+  - AC-1.1 ps1 列表含 gamma
+  - AC-1.2 ps1 删除后 alpha 消失
+  - AC-1.2 ps1 删除后 beta 消失
+  - AC-1.2 ps1 删除后 gamma 消失
+  - AC-1.2 ps1 删除后 single 块保留
+  - AC-1.3 ps1 拒绝删除后 Host 行数不变
+  - AC-1.3 sh 多别名含通配时整块受保护（未被删）
+  - AC-1.3 sh 拒绝删除后 Host 行数不变
+
+临时假 HOME 目录（可手工清理）: /tmp/tmp.*

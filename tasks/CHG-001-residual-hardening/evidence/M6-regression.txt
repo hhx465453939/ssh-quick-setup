@@ -1,0 +1,93 @@
+# M6 证据 — DoD 全量回归 + 约束检查
+# 时间: 2026-10-24T01:58:58Z
+
+## 1. 全量 harness（DoD: 语法 + AC + CHG-000 回归）
+被测脚本:
+  sh : /e/Development/ssh-quick-setup/ssh-remove.sh
+  ps1: /e/Development/ssh-quick-setup/ssh-remove.ps1
+
+==== 0. 语法检查（仓库原生手段） ====
+  PASS  bash -n ssh-setup.sh
+  PASS  bash -n ssh-remove.sh
+  PASS  bash -n ssh-remove.sh
+  PASS  PSParser ssh-setup.ps1
+  PASS  PSParser ssh-remove.ps1
+
+==== 1. R1 多别名解析（sh 侧 / AC-1.1~1.2） ====
+  PASS  AC-1.1 sh 列表含 beta
+  PASS  AC-1.1 sh 列表含 gamma
+  PASS  AC-1.2 sh 删除后 alpha 消失
+  PASS  AC-1.2 sh 删除后 beta 消失
+  PASS  AC-1.2 sh 删除后 gamma 消失
+  PASS  AC-1.2 sh 删除后 single 块保留
+  PASS  AC-1.2 sh single 的 HostName 保留
+
+==== 2. R1 多别名解析（ps1 侧 / AC-1.1~1.2） ====
+  PASS  AC-1.1 ps1 列表含 beta
+  PASS  AC-1.1 ps1 列表含 gamma
+  PASS  AC-1.2 ps1 删除后 alpha 消失
+  PASS  AC-1.2 ps1 删除后 beta 消失
+  PASS  AC-1.2 ps1 删除后 gamma 消失
+  PASS  AC-1.2 ps1 删除后 single 块保留
+
+==== 3. R1 通配保护（AC-1.3~1.4） ====
+  PASS  AC-1.3 ps1 删除普通块后 Host * 仍保留
+  PASS  AC-1.3 ps1 删除普通块后通配块仍保留
+  PASS  AC-1.3 ps1 多别名含通配时整块受保护（未被删）
+  PASS  AC-1.3 ps1 拒绝删除后 Host 行数不变
+  PASS  AC-1.3 sh 多别名含通配时整块受保护（未被删）
+  PASS  AC-1.3 sh 拒绝删除后 Host 行数不变
+
+==== 4. R2 Match 块边界（AC-2.1~2.3） ====
+  PASS  AC-2.2 ps1 Match 段内键名不出现为条目
+  PASS  AC-2.1 ps1 删除 before-block
+  PASS  AC-2.1 ps1 Match 段键值保留(ServerAliveInterval)
+  PASS  AC-2.1 ps1 Match 段键值保留(TCPKeepAlive)
+  PASS  AC-2.1 ps1 Match 行保留
+  PASS  AC-2.3 ps1 后续 Host 块保留
+  PASS  AC-2.1 sh Match 段键值保留
+  PASS  AC-2.1 sh Match 行保留
+  PASS  AC-2.3 sh 后续 Host 块保留
+
+==== 5. CHG-000 回归（不得回退） ====
+  PASS  REG ps1 PS5.1 中文注释下仍识别 zh-block
+  PASS  REG ps1 中文注释下仍识别 zh-second
+  PASS  REG ps1 中文注释完好保留
+  PASS  REG ps1 zh-block 已删除
+  PASS  REG ps1 config 时间戳备份已生成
+  PASS  REG sh 中文注释下仍识别 zh-block
+  PASS  REG sh 中文注释完好保留
+
+══════════ 结果 ══════════
+  PASS: 40
+  FAIL: 0
+
+全部通过。
+
+## 2. 约束 C2：bash 4+ 专属特性扫描（应无命中）
+ssh-remove.sh:140:# 不能用 mapfile/readarray：它们是 bash 4.0+ 才有的命令，
+ssh-remove.sh:142:# "mapfile: command not found" 把整个脚本干掉。改用 bash 3.2 也支持的 while read。
+  WARN: 命中 bash4+ 特性
+
+## 3. 约束 C3：ps1 的 config 读写必须走 .NET（Get-Content 只允许出现在注释/说明）
+35:    if (-not (Test-Path $backup)) { [System.IO.File]::WriteAllBytes($backup, $bytes) }
+36:    [System.IO.File]::WriteAllText($ConfigFile, [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3), (New-Object System.Text.UTF8Encoding($false)))
+70:        try { $err = [System.IO.File]::ReadAllText($errFile) } catch { $err = $null }
+94:    $content = @([System.IO.File]::ReadAllText($Path) -split "`r?`n")
+144:    $content = @([System.IO.File]::ReadAllText($Path) -split "`r?`n")
+183:        [System.IO.File]::WriteAllText($backup, [System.IO.File]::ReadAllText($Path), (New-Object System.Text.UTF8Encoding($false)))
+189:    [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
+  --- Get-Content/Set-Content 实际调用点 ---
+303:    $p = (((Get-Content $keyPubPath -TotalCount 1) -join '')).Trim() -split '\s+'
+
+## 4. 约束 C5：删除安全顺序（远端 → 本地密钥 → config）
+329:Write-Host "  远端 authorized_keys 清理（可选）" -ForegroundColor White
+416:# ── 2. 删除本地密钥文件 ───────────────────────────────────────
+426:        Write-Ok "已删除本地密钥: $keyBasename / ${keyBasename}.pub"
+431:# ── 3. 从 SSH config 移除 ────────────────────────────────────
+434:    Write-Ok "已从 SSH config 移除 Host $alias"
+239:echo -e "  \033[97m远端 authorized_keys 清理（可选）\033[0m"
+330:# ── 2. 删除本地密钥 ──────────────────────────────────────────
+333:    ok "已删除本地密钥: $KEY_BASENAME / ${KEY_BASENAME}.pub"
+338:remove_config_entry "$ALIAS"
+339:ok "已从 SSH config 移除 Host $ALIAS"

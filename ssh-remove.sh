@@ -36,19 +36,33 @@ info()  { echo -e "  \033[90m$1\033[0m"; }
 repair_config_bom
 
 # ── 解析 SSH config ───────────────────────────────────────────
+# 输出字段：first_alias|host|port|user|key|mode|fp|label|raw
+#   first_alias 保持旧行为（删除匹配用，末字兼容前 7 字段位置）
+#   label 展示（a,b,c）；raw 归一化别名串（通配保护判定用）
 parse_ssh_config() {
     if [[ ! -f "$CONFIG_FILE" ]]; then return; fi
 
-    local entry_name="" entry_host="" entry_port="" entry_user="" entry_key="" entry_mode="" entry_fp=""
+    local entry_first="" entry_label="" entry_raw=""
+    local entry_host="" entry_port="" entry_user="" entry_key="" entry_mode="" entry_fp=""
     local in_block=false
 
     while IFS= read -r line; do
-        if [[ "$line" =~ ^[[:space:]]*Host[[:space:]]+([^#[:space:]]+) ]]; then
+        # 必须取得【全部】别名：旧写法 ([^#[:space:]]+) 只取首名，
+        # 导致 Host web1 web*.corp 这类块的通配保护失效（会被当普通块删掉）
+        if [[ "$line" =~ ^[[:space:]]*Host[[:space:]]+(.*)$ ]]; then
             # 输出上一个条目
-            if [[ -n "$entry_name" ]]; then
-                echo "$entry_name|$entry_host|${entry_port:-22}|$entry_user|$entry_key|$entry_mode|$entry_fp"
+            if [[ -n "$entry_first" ]]; then
+                echo "$entry_first|$entry_host|${entry_port:-22}|$entry_user|$entry_key|$entry_mode|$entry_fp|$entry_label|$entry_raw"
             fi
-            entry_name="${BASH_REMATCH[1]}"
+            local _raw="${BASH_REMATCH[1]}"
+            _raw="${_raw%%#*}"          # 剥离行内注释
+            local -a _names=()
+            local _t
+            for _t in $_raw; do _names+=("$_t"); done
+            if [[ ${#_names[@]} -eq 0 ]]; then continue; fi
+            entry_first="${_names[0]}"
+            entry_raw="${_names[*]}"
+            entry_label="$(IFS=,; printf '%s' "${_names[*]}")"
             entry_host=""; entry_port=""; entry_user=""; entry_key=""; entry_mode=""; entry_fp=""
             in_block=true
         elif $in_block; then
@@ -63,8 +77,8 @@ parse_ssh_config() {
     done < "$CONFIG_FILE"
 
     # 输出最后一个条目
-    if [[ -n "$entry_name" ]]; then
-        echo "$entry_name|$entry_host|${entry_port:-22}|$entry_user|$entry_key|$entry_mode|$entry_fp"
+    if [[ -n "$entry_first" ]]; then
+        echo "$entry_first|$entry_host|${entry_port:-22}|$entry_user|$entry_key|$entry_mode|$entry_fp|$entry_label|$entry_raw"
     fi
 }
 
@@ -140,11 +154,12 @@ echo ""
 echo -e "  当前已配置的 SSH 连接:"
 echo -e "  \033[90m-------------------------------\033[0m"
 for i in "${!ENTRIES[@]}"; do
-    IFS='|' read -r name host port user key _mode _fp <<< "${ENTRIES[$i]}"
+    IFS='|' read -r name host port user key _mode _fp label raw <<< "${ENTRIES[$i]}"
+    [[ -n "${label:-}" ]] || label="$name"
     tag=""
-    # Host * / Host *.corp 这类通配与条件段是全局默认值，必须标出来并不允许删
-    [[ "$name" == *[*?]* ]] && tag="   <- 通配符/条件段，禁止删除"
-    printf "  \033[97m[%d] %-12s %s@%s:%s%s\033[0m\n" "$((i+1))" "$name" "$user" "$host" "$port" "$tag"
+    # 任一名含通配符即整块受保护（Host * / Host web1 web*.corp）
+    [[ "${raw:-$name}" == *[*?]* ]] && tag="   <- 通配符/条件段，禁止删除"
+    printf "  \033[97m[%d] %-20s %s@%s:%s%s\033[0m\n" "$((i+1))" "$label" "$user" "$host" "$port" "$tag"
 done
 echo -e "  \033[90m-------------------------------\033[0m"
 
@@ -156,12 +171,13 @@ if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [[ "$CHOICE" -lt 1 ]] || [[ "$CHOICE" -gt ${
     err "无效的编号。"; exit 1
 fi
 
-IFS='|' read -r ALIAS HOST_NAME PORT USER_NAME KEY_FILE MODE FP <<< "${ENTRIES[$((CHOICE-1))]}"
+IFS='|' read -r ALIAS HOST_NAME PORT USER_NAME KEY_FILE MODE FP ALIAS_LABEL ALIAS_RAW <<< "${ENTRIES[$((CHOICE-1))]}"
+ALIAS_LABEL="${ALIAS_LABEL:-$ALIAS}"
+ALIAS_RAW="${ALIAS_RAW:-$ALIAS}"
 
-# Host * / Host *.corp 这类段是全局默认值（ServerAliveInterval / User / IdentityFile 等），
-# 删掉会波及所有连接，必须拒绝（旧版会把它们当普通条目列出并可删）。
-if [[ "$ALIAS" == *[*?]* ]]; then
-    err "条目 [$ALIAS] 是通配符/条件段（如 Host *），删除会破坏所有连接的默认配置，已拒绝。"
+# 任一名含通配符即整块受保护。旧版只看首名，会把 Host web1 web*.corp 当普通块删掉。
+if [[ "$ALIAS_RAW" == *[*?]* ]]; then
+    err "条目 [$ALIAS_LABEL] 是通配符/条件段（如 Host *），删除会破坏所有连接的默认配置，已拒绝。"
     info "如确实要清理，请手动编辑: $CONFIG_FILE"
     exit 1
 fi
@@ -183,7 +199,7 @@ KEY_PUB_PATH="${KEY_PATH:+$KEY_PATH.pub}"
 echo ""
 echo -e "  \033[33m即将删除:\033[0m"
 echo -e "  \033[90m-------------------------------\033[0m"
-echo -e "  别名   : $ALIAS"
+echo -e "  别名   : $ALIAS_LABEL"
 echo -e "  地址   : $HOST_NAME"
 echo -e "  端口   : $PORT"
 echo -e "  用户   : $USER_NAME"

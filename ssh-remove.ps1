@@ -96,19 +96,28 @@ function Get-SshEntries {
     $current = $null
 
     foreach ($line in $content) {
-        if ($line -match '^\s*Host\s+(\S+)\s*$') {
-            if ($null -ne $current) { $entries += $current }
-            $current = @{
-                Name     = $Matches[1]
-                Lines    = @($line)
-                HostName = ""
-                Port     = ""
-                User     = ""
-                KeyFile  = ""
-                Mode     = ""
-                Fp       = ""
-                # Host * / Host *.corp 这类通配与条件段是全局默认值，删掉会波及所有连接
-                IsPattern = ($Matches[1] -match '[*?!]')
+        # Host 行可含多个别名（Host a b c）与行内注释，必须取全部 token：
+        # 旧正则 ^\s*Host\s+(\S+)\s*$ 要求「单 token + 行尾」，对多别名行完全无法匹配，
+        # 导致该行与其配置被丢弃或并入前一块（数据错乱），且该块无法被删除。
+        if ($line -match '^\s*Host\s+(.+?)\s*$') {
+            $namesRaw = @(($Matches[1] -replace '#.*$', '').Trim() -split '\s+') | Where-Object { $_ }
+            if ($namesRaw.Count -gt 0) {
+                if ($null -ne $current) { $entries += $current }
+                $current = @{
+                    Name      = ($namesRaw -join ', ')   # 展示：alpha, beta, gamma
+                    NameRaw   = ($namesRaw -join ' ')     # 归一化别名串，删除时逐 token 精确比对
+                    Aliases   = @($namesRaw)
+                    Lines     = @($line)
+                    HostName  = ""
+                    Port      = ""
+                    User      = ""
+                    KeyFile   = ""
+                    Mode      = ""
+                    Fp        = ""
+                    # 任一名含通配符即整块受保护（Host * / Host web1 web*.corp）：
+                    # 只看首名会漏掉后置的通配模式，从而误删全局段
+                    IsPattern = [bool](@($namesRaw | Where-Object { $_ -match '[*?!]' }).Count)
+                }
             }
         }
         elseif ($null -ne $current) {
@@ -128,21 +137,25 @@ function Get-SshEntries {
 
 # ── 从 config 中移除指定 Host 段 ──────────────────────────────
 function Remove-SshConfigEntry {
-    param([string]$Path, [string]$Alias)
+    # $AliasTokens 为归一化后的别名串（如 "alpha beta gamma"）。
+    # 用「归一化后逐 token 比对」而非正则：既避开正则元字符转义，也容忍原文多空格对齐。
+    param([string]$Path, [string]$AliasTokens)
 
     $content = @([System.IO.File]::ReadAllText($Path) -split "`r?`n")
     $newContent = [System.Collections.ArrayList]::new()
     $skip = $false
     $found = $false
 
-    # 别名必须转义：若含 . * + ( 等正则元字符，未转义会误匹配到别的 Host
-    $aliasPattern = [regex]::Escape($Alias)
+    $targetKey = ((@($AliasTokens.Trim() -split '\s+') | Where-Object { $_ }) -join ' ')
 
     foreach ($line in $content) {
-        if ($line -match "^\s*Host\s+$aliasPattern\s*$") {
-            $skip = $true
-            $found = $true
-            continue
+        if ($line -match '^\s*Host\s+(.+?)\s*$') {
+            $lineKey = ((@((($Matches[1]) -replace '#.*$', '').Trim() -split '\s+') | Where-Object { $_ }) -join ' ')
+            if ($lineKey -eq $targetKey) {
+                $skip = $true
+                $found = $true
+                continue
+            }
         }
         if ($skip) {
             # 遇到下一个 Host 段或非缩进行时停止跳过
@@ -238,7 +251,9 @@ if ($target.IsPattern) {
     exit 1
 }
 
-$alias = $target.Name
+$alias = $target.Name                        # 展示用（多别名时为 "a, b, c"）
+$aliasTokens = $target.NameRaw                # 删除匹配用（归一化 "a b c"）
+$aliasFirst = @(@($target.Aliases)[0])[0]     # 密钥兜底文件名用首个别名
 
 Write-Host ""
 Write-Host "  即将删除:" -ForegroundColor Yellow
@@ -256,12 +271,12 @@ if ($target.KeyFile) {
     if (Test-Path $kf) { $keyPath = $kf }
 }
 if (-not $keyPath) {
-    $fallback = "$SshDir\id_ed25519_$alias"
+    $fallback = "$SshDir\id_ed25519_$aliasFirst"
     if (Test-Path $fallback) { $keyPath = $fallback }
 }
-$keyPubPath = if ($keyPath) { "$keyPath.pub" } else { "$SshDir\id_ed25519_$alias.pub" }
+$keyPubPath = if ($keyPath) { "$keyPath.pub" } else { "$SshDir\id_ed25519_$aliasFirst.pub" }
 $hasKey = [bool]$keyPath
-$keyBasename = if ($hasKey) { [System.IO.Path]::GetFileName($keyPath) } else { "id_ed25519_$alias" }
+$keyBasename = if ($hasKey) { [System.IO.Path]::GetFileName($keyPath) } else { "id_ed25519_$aliasFirst" }
 if ($hasKey) {
     Write-Host "  密钥   : $keyPath" -ForegroundColor White
 }
@@ -414,7 +429,7 @@ if ($hasKey -or (Test-Path $keyPubPath)) {
 }
 
 # ── 3. 从 SSH config 移除 ────────────────────────────────────
-$removed = Remove-SshConfigEntry -Path $ConfigFile -Alias $alias
+$removed = Remove-SshConfigEntry -Path $ConfigFile -AliasTokens $aliasTokens
 if ($removed) {
     Write-Ok "已从 SSH config 移除 Host $alias"
     $deleted += "SSH config 条目"
