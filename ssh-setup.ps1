@@ -108,16 +108,54 @@ function Get-BashPath {
         return $script:BashExe
     }
     $script:BashExe = ''
-    # 优先选与 ssh-keygen 同源的 Git bash（路径语义一致，能直接吃 C:/ 风格路径）
+
+    # Git for Windows 的两种布局：<root>\bin\bash.exe（推荐）与 <root>\usr\bin\bash.exe
+    $relCands = @('bin\bash.exe', 'usr\bin\bash.exe')
+    $findBashUnder = {
+        param([string]$Root)
+        if ([string]::IsNullOrWhiteSpace($Root)) { return '' }
+        foreach ($rel in $relCands) {
+            $cand = Join-Path $Root $rel
+            if (Test-Path $cand) { return $cand }
+        }
+        return ''
+    }
+
+    # ① 与 ssh-keygen 同源的 Git bash（路径语义一致，能直接吃 C:/ 风格路径）。
+    #    注意：若 ssh-keygen 来自 Windows 自带 OpenSSH（C:\Windows\System32\OpenSSH\），
+    #    这一步必然落空，靠 ② 兜底。
     $kg = Get-Command ssh-keygen -ErrorAction SilentlyContinue
     if ($kg -and $kg.Source) {
         $gitRoot = Split-Path (Split-Path $kg.Source -Parent) -Parent
-        $cand = Join-Path $gitRoot 'bin\bash.exe'
-        if (Test-Path $cand) { $script:BashExe = $cand }
+        $script:BashExe = [string](& $findBashUnder $gitRoot)
     }
+
+    # ② 用 git.exe 反推 Git 安装根：<root>\cmd\git.exe → <root>\bin\bash.exe。
+    #    很多机器上 PATH 里只有 Git\cmd，没有 Git\bin，所以不能只依赖 Get-Command bash。
+    if ($script:BashExe -eq '') {
+        $g = Get-Command git -ErrorAction SilentlyContinue
+        if ($g -and $g.Source) {
+            $script:BashExe = [string](& $findBashUnder (Split-Path (Split-Path $g.Source -Parent) -Parent))
+        }
+    }
+
+    # ③ 常见安装位置兜底（PATH 里没有 git，但装过 Git for Windows）
+    if ($script:BashExe -eq '') {
+        $roots = @(
+            (Join-Path $env:ProgramFiles 'Git'),
+            (Join-Path ${env:ProgramFiles(x86)} 'Git'),
+            (Join-Path $env:LOCALAPPDATA 'Programs\Git'),
+            'C:\Program Files\Git'
+        )
+        foreach ($root in $roots) {
+            $script:BashExe = [string](& $findBashUnder $root)
+            if ($script:BashExe -ne '') { break }
+        }
+    }
+
+    # ④ 最后才信 PATH 上的 bash，并排除 WSL 的 System32\bash.exe（它看不到 C:/ 路径）
     if ($script:BashExe -eq '') {
         $cmd = Get-Command bash -ErrorAction SilentlyContinue
-        # 排除 WSL 的 System32\bash.exe（它看不到 C:/ 路径）
         if ($cmd -and $cmd.Source -notmatch '\\System32\\bash\.exe$') { $script:BashExe = $cmd.Source }
     }
     if ($script:BashExe -eq '') { return $null }
@@ -262,7 +300,12 @@ function New-LocalKey {
         }
         if (-not $ok) {
             Write-Warn "非交互生成失败，改用交互式生成（口令处直接回车即为免密）..."
-            & ssh-keygen -t ed25519 -C $comment -f $keyFile
+            # 必须 Out-Host：ssh-keygen 交互模式会把 "Generating public/private ed25519 key pair."
+            # "Your identification has been saved in ..."、指纹和 randomart 全部写到 stdout，
+            # 而 PowerShell 函数的返回值 = 函数体内所有【未被捕获】的输出流，
+            # 这些文本会跟末尾的 return $keyFile 一起混成数组返回，
+            # 让 $KeyFile 变成一大段多行文本，后面 "$KeyFile.pub" / GetFileName($KeyFile) 全部取错值。
+            & ssh-keygen -t ed25519 -C $comment -f $keyFile | Out-Host
             $ok = ($LASTEXITCODE -eq 0 -and (Test-Path $keyFile))
         }
         if (-not $ok) {
@@ -446,7 +489,8 @@ function Send-PublicKey {
         # 用 .NET 读取而非 Get-Content -Raw：-Raw 是 FileSystem provider 的动态参数，
         # 在受限语言模式或异常模块状态下会直接崩在这里（报「找不到参数 Raw」）
         $pubText = ([System.IO.File]::ReadAllText("$KeyFile.pub")) -replace "`r`n", "`n"
-        $pubText | & ssh -p $Port "${User}@${TargetHost}" $remoteCmd
+        # Out-Host：ssh 的 stdout 同样不能留在函数输出流里，否则会污染 Send-PublicKey 的布尔返回值
+        $pubText | & ssh -p $Port "${User}@${TargetHost}" $remoteCmd | Out-Host
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "公钥上传成功!"
             return $true
@@ -545,10 +589,21 @@ if ($Mode -eq 1) {
 } else {
     $KeyFile = Import-ServerKey -Alias $Alias
 }
-if (-not $KeyFile) {
+# 硬校验：返回值必须是【单个】已存在的私钥文件路径。
+# 历史 bug：交互式 ssh-keygen 的 stdout 混进函数返回值，$KeyFile 变成多行文本，
+# 后面 Test-Path "$KeyFile.pub" 必然失败、config 里也会写入垃圾 IdentityFile。
+$keyCandidates = @(@($KeyFile) | Where-Object { $_ -is [string] -and -not [string]::IsNullOrWhiteSpace($_) })
+if ($keyCandidates.Count -ne 1 -or -not (Test-Path -LiteralPath $keyCandidates[0] -PathType Leaf)) {
     Write-Err "私钥准备失败，退出。"
+    if ($keyCandidates.Count -ne 1) {
+        Write-Info "函数返回值异常（期望 1 个路径，实得 $($keyCandidates.Count) 段）。原始内容:"
+        foreach ($c in $keyCandidates) { Write-Info "  $c" }
+    } else {
+        Write-Info "路径不存在: $($keyCandidates[0])"
+    }
     exit 1
 }
+$KeyFile = $keyCandidates[0].Trim()
 
 # ── 第 4 步：上传公钥（仅模式 1） ─────────────────────────────
 if ($Mode -eq 1) {
@@ -571,6 +626,22 @@ if (Test-Path $ConfigFile) {
 if ($alreadyConfigured) {
     Write-Warn "SSH config 中已存在 Host $Alias 配置，跳过写入。"
     Write-Info "如需修改，请手动编辑: $ConfigFile"
+
+    # 旧配置里的 IdentityFile 可能指向不存在的密钥（上次运行中断/写入坏路径的残留），
+    # 这种残留会让免密测试必然失败，而且看起来像『服务器问题』，所以单独校验一次。
+    $gOut = (Invoke-Native 'ssh' @('-G', $Alias)).Output
+    $idLines = @(@($gOut -split "`n") |
+        Where-Object { $_ -match '^\s*identityfile\s+' } |
+        ForEach-Object { ($_ -replace '^\s*identityfile\s+', '').Trim().Trim('"') })
+    $badId = @($idLines | Where-Object {
+        $p = ($_ -replace '^~', $env:USERPROFILE) -replace '/', '\'
+        -not (Test-Path -LiteralPath $p)
+    })
+    if ($badId.Count -gt 0) {
+        Write-Warn "该 Host 的 IdentityFile 指向不存在的文件，免密测试必然失败:"
+        foreach ($b in $badId) { Write-Info "  $b" }
+        Write-Info "修复：删掉 config 里 Host $Alias 整段后重跑本脚本（或把 IdentityFile 改为 ~/.ssh/$keyName）"
+    }
 } else {
     # 写入标记行：记录模式/密钥/指纹，供日后核对与 ssh-remove 判断风险（mode=2 为服务端下发私钥）
     $fpLine = Get-KeyFingerprint -Path $KeyFile
