@@ -438,7 +438,11 @@ function Import-ServerKey {
             $parts = ($pubRaw -split '\s+')
             $pubLine = "$($parts[0]) $($parts[1]) $Alias-ssh-key-$(Get-Date -Format 'yyyyMMdd-HHmm')"
             Write-TextNoBom -Path "$dest.pub" -Text ($pubLine + "`n")
+            Write-Ok "已导出公钥: $dest.pub"
         } else {
+            # 导不出公钥说明私钥带口令（或无法解出），此时旧的 $dest.pub 已与新私钥不匹配，
+            # 留着会让人误以为公钥已同步，必须清掉（与 ssh-setup.sh 的 rm -f "$dest.pub" 对齐）
+            if (Test-Path "$dest.pub") { Remove-Item "$dest.pub" -Force -ErrorAction SilentlyContinue }
             if ((Test-KeyPassphraseFree -Path $dest) -eq $false) {
                 Write-Warn "该私钥带口令，每次登录需输入口令（可执行 ssh-keygen -p -f `"$dest`" 修改）。"
             } else {

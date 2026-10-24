@@ -19,7 +19,8 @@ repair_config_bom() {
     local head3
     head3=$(head -c 3 "$CONFIG_FILE" | od -An -tx1 | tr -d ' \n')
     [[ "$head3" == "efbbbf" ]] || return 0
-    cp "$CONFIG_FILE" "$CONFIG_FILE.bak-bom"
+    # 已存在的备份不覆盖：留住最原始那份（与 ssh-setup.sh / ssh-setup.ps1 一致）
+    [[ -f "$CONFIG_FILE.bak-bom" ]] || cp "$CONFIG_FILE" "$CONFIG_FILE.bak-bom"
     tail -c +4 "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
     warn "检测到 config 带 UTF-8 BOM（OpenSSH 会拒绝解析整个 config），已自动修复"
     info "原始文件已备份: $CONFIG_FILE.bak-bom"
@@ -70,12 +71,21 @@ parse_ssh_config() {
 # ── 从 config 中删除指定 Host ─────────────────────────────────
 remove_config_entry() {
     local alias="$1"
-    local tmpfile
+    local tmpfile backup alias_esc
     tmpfile=$(mktemp)
+
+    # 删除是不可逆操作：改写前留一份带时间戳备份（旧版直接覆盖，误删无法回滚）
+    backup="$CONFIG_FILE.bak-$(date +%Y%m%d-%H%M%S)"
+    if cp "$CONFIG_FILE" "$backup" 2>/dev/null; then
+        info "config 已备份: $backup"
+    fi
+
+    # 别名必须转义后再进正则：含 . * + 等元字符时未转义会误匹配到别的 Host
+    alias_esc=$(printf '%s' "$alias" | sed 's/[][\.*^$+?(){}|]/\\&/g')
 
     local in_block=false skip=false
     while IFS= read -r line; do
-        if [[ "$line" =~ ^[[:space:]]*Host[[:space:]]+${alias}([[:space:]]|$) ]]; then
+        if [[ "$line" =~ ^[[:space:]]*Host[[:space:]]+${alias_esc}([[:space:]]|$) ]]; then
             skip=true
             continue
         fi
@@ -113,9 +123,15 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
 fi
 
 # ── 列出已有配置 ──────────────────────────────────────────────
-mapfile -t ENTRIES < <(parse_ssh_config)
+# 不能用 mapfile/readarray：它们是 bash 4.0+ 才有的命令，
+# 而 macOS 系统自带的 /bin/bash 是 3.2（2007 年版本），跑到这行会直接
+# "mapfile: command not found" 把整个脚本干掉。改用 bash 3.2 也支持的 while read。
+ENTRIES=()
+while IFS= read -r _entry; do
+    [[ -n "$_entry" ]] && ENTRIES+=("$_entry")
+done < <(parse_ssh_config)
 
-if [[ ${#ENTRIES[@]} -eq 0 ]] || [[ -z "${ENTRIES[0]:-}" ]]; then
+if [[ ${#ENTRIES[@]} -eq 0 ]]; then
     warn "SSH config 中没有已配置的 Host。"
     exit 0
 fi
@@ -125,7 +141,10 @@ echo -e "  当前已配置的 SSH 连接:"
 echo -e "  \033[90m-------------------------------\033[0m"
 for i in "${!ENTRIES[@]}"; do
     IFS='|' read -r name host port user key _mode _fp <<< "${ENTRIES[$i]}"
-    printf "  \033[97m[%d] %-12s %s@%s:%s\033[0m\n" "$((i+1))" "$name" "$user" "$host" "$port"
+    tag=""
+    # Host * / Host *.corp 这类通配与条件段是全局默认值，必须标出来并不允许删
+    [[ "$name" == *[*?]* ]] && tag="   <- 通配符/条件段，禁止删除"
+    printf "  \033[97m[%d] %-12s %s@%s:%s%s\033[0m\n" "$((i+1))" "$name" "$user" "$host" "$port" "$tag"
 done
 echo -e "  \033[90m-------------------------------\033[0m"
 
@@ -138,6 +157,14 @@ if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [[ "$CHOICE" -lt 1 ]] || [[ "$CHOICE" -gt ${
 fi
 
 IFS='|' read -r ALIAS HOST_NAME PORT USER_NAME KEY_FILE MODE FP <<< "${ENTRIES[$((CHOICE-1))]}"
+
+# Host * / Host *.corp 这类段是全局默认值（ServerAliveInterval / User / IdentityFile 等），
+# 删掉会波及所有连接，必须拒绝（旧版会把它们当普通条目列出并可删）。
+if [[ "$ALIAS" == *[*?]* ]]; then
+    err "条目 [$ALIAS] 是通配符/条件段（如 Host *），删除会破坏所有连接的默认配置，已拒绝。"
+    info "如确实要清理，请手动编辑: $CONFIG_FILE"
+    exit 1
+fi
 
 # 密钥路径优先取自 config 里的 IdentityFile（兼容导入模式下的 id_rsa_<别名>）
 KEY_PATH=""
@@ -301,7 +328,9 @@ echo ""
 echo -e "\033[35m=====================================\033[0m"
 echo -e "\033[35m  删除完成\033[0m"
 echo -e "\033[35m=====================================\033[0m"
-for d in "${DELETED[@]}"; do ok "$d"; done
+if [[ ${#DELETED[@]} -gt 0 ]]; then
+    for d in "${DELETED[@]}"; do ok "$d"; done
+fi
 
 # ── 闭环核对：远端到底还有没有这条公钥 ──────────────────────
 echo ""

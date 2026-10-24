@@ -35,7 +35,8 @@ repair_config_bom() {
     local head3
     head3=$(head -c 3 "$CONFIG_FILE" | od -An -tx1 | tr -d ' \n')
     [[ "$head3" == "efbbbf" ]] || return 0
-    cp "$CONFIG_FILE" "$CONFIG_FILE.bak-bom"
+    # 已存在的备份不覆盖：留住最原始那份，便于回溯（与 ssh-setup.ps1 行为一致）
+    [[ -f "$CONFIG_FILE.bak-bom" ]] || cp "$CONFIG_FILE" "$CONFIG_FILE.bak-bom"
     tail -c +4 "$CONFIG_FILE" > "$CONFIG_FILE.tmp" && mv "$CONFIG_FILE.tmp" "$CONFIG_FILE"
     warn "检测到 config 带 UTF-8 BOM（OpenSSH 会拒绝解析整个 config），已自动修复"
     info "原始文件已备份: $CONFIG_FILE.bak-bom"
@@ -358,7 +359,13 @@ if [[ "$MODE" == "1" ]]; then
 else
     import_server_key "$ALIAS" || { err "私钥准备失败，退出。"; exit 1; }
 fi
-[[ -n "$KEY_FILE" && -f "$KEY_FILE" ]] || { err "私钥准备失败，退出。"; exit 1; }
+if [[ -z "$KEY_FILE" || ! -f "$KEY_FILE" ]]; then
+    err "私钥准备失败，退出。"
+    if [[ -n "$KEY_FILE" ]]; then
+        info "实际路径不存在: $KEY_FILE"
+    fi
+    exit 1
+fi
 
 # ── 第 4 步：上传公钥（仅模式 1） ─────────────────────────────
 if [[ "$MODE" == "1" ]]; then
@@ -375,9 +382,31 @@ touch "$CONFIG_FILE"
 
 KEY_NAME=$(basename "$KEY_FILE")
 
-if grep -q "^Host $ALIAS\$" "$CONFIG_FILE" 2>/dev/null; then
+# Host 名匹配放宽到 ps1 同等宽容度：行首可有空白、Host 与别名间可多空格。
+# 原写法 "^Host $ALIAS$" 只认「行首 Host+单空格」，遇到手工整理的缩进/对齐写法会误判
+# 为「不存在」而重复追写第二个 Host 块，且前一块的 IdentityFile 会覆盖后一块。
+if grep -Eq "^[[:space:]]*Host[[:space:]]+${ALIAS}[[:space:]]*$" "$CONFIG_FILE" 2>/dev/null; then
     warn "SSH config 中已存在 Host $ALIAS 配置，跳过写入。"
     info "如需修改，请手动编辑: $CONFIG_FILE"
+
+    # 旧配置里的 IdentityFile 可能指向已不存在的密钥（上次运行中断/写入坏路径的残留），
+    # 这类残留会让免密测试必然失败，看起来却像『服务器问题』，所以单独校验一次。
+    # 注：变量不用 local（此处位于脚本主体，非函数内）
+    ID_FILES=()
+    while IFS= read -r id_path; do
+        [[ -n "$id_path" ]] || continue
+        ID_FILES+=("${id_path/#\~/$HOME}")
+    done < <(ssh -G "$ALIAS" 2>/dev/null | awk 'tolower($1) == "identityfile" { $1 = ""; sub(/^[[:space:]]+/, ""); print }')
+    BAD_ID=()
+    for id_path in ${ID_FILES[@]:+"${ID_FILES[@]}"}; do
+        [[ -n "$id_path" ]] || continue
+        [[ -f "$id_path" ]] || BAD_ID+=("$id_path")
+    done
+    if [[ ${#BAD_ID[@]} -gt 0 ]]; then
+        warn "该 Host 的 IdentityFile 指向不存在的文件，免密测试必然失败:"
+        for id_path in "${BAD_ID[@]}"; do info "  $id_path"; done
+        info "修复：删掉 config 里 Host $ALIAS 整段后重跑本脚本（或把 IdentityFile 改为 ~/.ssh/$KEY_NAME）"
+    fi
 else
     # 写入标记行：记录模式/密钥/指纹，供日后核对与 ssh-remove 判断风险（mode=2 为服务端下发私钥）
     FP_HASH=$( { key_fingerprint "$KEY_FILE" | sed -n 's/.*\(SHA256:[A-Za-z0-9+/=]*\).*/\1/p' | head -1; } || true )

@@ -26,6 +26,18 @@ function Write-Warn  { param([string]$Msg) Write-Host "  [!] $Msg" -ForegroundCo
 function Write-Err   { param([string]$Msg) Write-Host "  [X] $Msg" -ForegroundColor Red }
 function Write-Info  { param([string]$Msg) Write-Host "  $Msg" -ForegroundColor Gray }
 
+# 修复历史遗留的 UTF-8 BOM（OpenSSH 遇到 BOM 会放弃解析整个 config）
+function Repair-ConfigBom {
+    if (-not (Test-Path $ConfigFile)) { return }
+    $bytes = [System.IO.File]::ReadAllBytes($ConfigFile)
+    if ($bytes.Length -lt 3 -or $bytes[0] -ne 0xEF -or $bytes[1] -ne 0xBB -or $bytes[2] -ne 0xBF) { return }
+    $backup = "$ConfigFile.bak-bom"
+    if (-not (Test-Path $backup)) { [System.IO.File]::WriteAllBytes($backup, $bytes) }
+    [System.IO.File]::WriteAllText($ConfigFile, [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3), (New-Object System.Text.UTF8Encoding($false)))
+    Write-Warn "检测到 config 带 UTF-8 BOM（OpenSSH 会拒绝解析整个 config），已自动修复"
+    Write-Info "原始文件已备份: $backup"
+}
+
 # 把 PowerShell 对原生命令 stderr 的包装文本清理成一句话
 function Get-MeaningfulError {
     param([string]$Text)
@@ -53,7 +65,9 @@ function Invoke-Native {
     try {
         $out = & $File @Arguments 2> $errFile
         $code = $LASTEXITCODE
-        $err = Get-Content $errFile -Raw -ErrorAction SilentlyContinue
+        # 同 ssh-setup.ps1：Get-Content -Raw 属于 FileSystem provider 的动态参数，
+        # 在受限语言模式或模块状态异常时会报「找不到参数 Raw」，统一改走 .NET
+        try { $err = [System.IO.File]::ReadAllText($errFile) } catch { $err = $null }
     } finally {
         $ErrorActionPreference = $old
         Remove-Item $errFile -Force -ErrorAction SilentlyContinue
@@ -72,7 +86,12 @@ function Get-SshEntries {
 
     if (-not (Test-Path $Path)) { return @() }
 
-    $content = Get-Content $Path -ErrorAction SilentlyContinue
+    # 必须用 .NET 读取：PS 5.1 的 Get-Content 对「无 BOM 的 UTF-8」按 ANSI(GBK) 解码，
+    # 中文注释会变乱码并吞掉换行符，紧随其后的 Host 行就不再独占一行，
+    # 被下面的 ^\s*Host\s+(\S+)\s*$ 漏掉。
+    # 实测（PS 5.1，config 首行是中文注释）：Get-Content 只能识别出后面几个 Host，
+    # 第一个 Host 直接“消失”；换用 .NET ReadAllText 后全部条目正确。
+    $content = @([System.IO.File]::ReadAllText($Path) -split "`r?`n")
     $entries = @()
     $current = $null
 
@@ -88,6 +107,8 @@ function Get-SshEntries {
                 KeyFile  = ""
                 Mode     = ""
                 Fp       = ""
+                # Host * / Host *.corp 这类通配与条件段是全局默认值，删掉会波及所有连接
+                IsPattern = ($Matches[1] -match '[*?!]')
             }
         }
         elseif ($null -ne $current) {
@@ -109,13 +130,16 @@ function Get-SshEntries {
 function Remove-SshConfigEntry {
     param([string]$Path, [string]$Alias)
 
-    $content = Get-Content $Path -ErrorAction SilentlyContinue
+    $content = @([System.IO.File]::ReadAllText($Path) -split "`r?`n")
     $newContent = [System.Collections.ArrayList]::new()
     $skip = $false
     $found = $false
 
+    # 别名必须转义：若含 . * + ( 等正则元字符，未转义会误匹配到别的 Host
+    $aliasPattern = [regex]::Escape($Alias)
+
     foreach ($line in $content) {
-        if ($line -match "^\s*Host\s+$Alias\s*$") {
+        if ($line -match "^\s*Host\s+$aliasPattern\s*$") {
             $skip = $true
             $found = $true
             continue
@@ -140,6 +164,14 @@ function Remove-SshConfigEntry {
     $trimmed = $newContent | Where-Object { $_ -ne $null }
     $text = ($trimmed -join "`n").TrimEnd()
     $text += "`n"
+    # 删除是不可逆操作：改写前留一份带时间戳备份，正则误判时能手工回滚
+    $backup = "$Path.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    try {
+        [System.IO.File]::WriteAllText($backup, [System.IO.File]::ReadAllText($Path), (New-Object System.Text.UTF8Encoding($false)))
+        Write-Info "config 已备份: $backup"
+    } catch {
+        Write-Warn "config 备份失败（$($_.Exception.Message)），仍继续删除。"
+    }
     # 必须无 BOM 写入：带 BOM 的 config 会让 OpenSSH 拒绝解析整个文件
     [System.IO.File]::WriteAllText($Path, $text, (New-Object System.Text.UTF8Encoding($false)))
 
@@ -154,6 +186,9 @@ Write-Host ""
 Write-Host "=====================================" -ForegroundColor Magenta
 Write-Host "  SSH 配置管理 - 删除连接" -ForegroundColor Magenta
 Write-Host "=====================================" -ForegroundColor Magenta
+
+# ── 修复 BOM（带 BOM 时 OpenSSH 不解析整个 config，且读写都会出偏差）──
+Repair-ConfigBom
 
 # ── 检查 config 是否存在 ──────────────────────────────────────
 if (-not (Test-Path $ConfigFile)) {
@@ -177,7 +212,8 @@ Write-Host "`n  当前已配置的 SSH 连接:" -ForegroundColor White
 Write-Host "  -------------------------------" -ForegroundColor Gray
 for ($i = 0; $i -lt $entries.Count; $i++) {
     $e = $entries[$i]
-    Write-Host ("  [{0}] {1,-12} {2}@{3}:{4}" -f ($i+1), $e.Name, $e.User, $e.HostName, $(if ($e.Port) { $e.Port } else { '22' })) -ForegroundColor White
+    $tag = if ($e.IsPattern) { '   <- 通配符/条件段，禁止删除' } else { '' }
+    Write-Host ("  [{0}] {1,-12} {2}@{3}:{4}{5}" -f ($i+1), $e.Name, $e.User, $e.HostName, $(if ($e.Port) { $e.Port } else { '22' }), $tag) -ForegroundColor White
 }
 Write-Host "  -------------------------------" -ForegroundColor Gray
 
@@ -193,6 +229,15 @@ if (-not [int]::TryParse($choice, [ref]$idx) -or $idx -lt 1 -or $idx -gt $entrie
 }
 
 $target = $entries[$idx - 1]
+
+# Host * / Host *.corp 这类段是全局默认值（ServerAliveInterval / User / IdentityFile 等），
+# 删掉会波及所有连接，必须拒绝（旧版会把它们当普通条目列出并可删）。
+if ($target.IsPattern) {
+    Write-Err "条目 [$($target.Name)] 是通配符/条件段（如 Host *），删除会破坏所有连接的默认配置，已拒绝。"
+    Write-Info "如确实要清理，请手动编辑: $ConfigFile"
+    exit 1
+}
+
 $alias = $target.Name
 
 Write-Host ""
